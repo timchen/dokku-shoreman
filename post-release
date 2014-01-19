@@ -1,28 +1,24 @@
 #!/bin/bash
+#
+# Forked from statianzo/dokku-shoreman
+
 APP="$1"; IMAGE="app/$APP"
 
-read -d '' runner <<'EOF'
-#!/bin/bash
-# **shoreman** is an implementation of the **Procfile** format. Inspired by
-# the original [foreman](http://ddollar.github.com/foreman/) tool for ruby,
-# as well as [norman](https://github.com/josh/norman) for node.js.
-
-# This version is altered for use within dokku
-# .env parsing has been removed
-# children are killed using their parent ID
-
+read -d '' shoreman <<'EOF'
 set -e
 export HOME=/app
 for file in \$HOME/.profile.d/*; do source \$file; done
 hash -r
 cd \$HOME
 
+PROCFILE=\${PROCFILE:-'Procfile'}
 while read line || [ -n "\$line" ]; do
   name=\${line%%:*}
   command=\${line#*: }
   echo "Starting \${name}..."
   sh -c "\${command} | sed -e 's/^/\${name}| /'" &
-done < "Procfile"
+done < "\$PROCFILE"
+
 
 onexit() {
   echo SIGINT received
@@ -38,14 +34,42 @@ EOF
 
 set -e
 
-# Check for Procfile
-id=$(docker run -d $IMAGE test -f app/Procfile)
-if [ $(docker wait $id) -ne 0 ]; then
-  exit 0
+check_procfile_exists() {
+  _procfile="$1"
+
+  id=$(docker run -d $IMAGE test -f "app/$_procfile")
+  if [ $(docker wait $id) -ne 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+PROCFILE='Procfile'
+RUNTIME_ENV=${RACK_ENV:-$RAILS_ENV}
+
+# TODO: actually loop this to check various Procfile possiblities
+if [[ ! -z "$RUNTIME_ENV" ]] && [[ `env | grep -q "^$RUNTIME_ENV="` -eq 0 ]]; then
+  PROCFILE="Procfile.${RUNTIME_ENV}"
+  check_procfile_exists "$PROCFILE"
+  ret=$?
+  if [[ "$ret" -ne 0 ]]; then
+    exit 0 # this is not a typo
+  fi
 fi
 
 echo "-----> Injecting Shoreman ..."
 
-id=$(echo "$runner" | docker run -i -a stdin $IMAGE /bin/bash -c "cat > /start")
+header="#!/bin/bash\n\nexport PROCFILE=$PROCFILE"
+
+# TODO: combine the two cat statements to avoid an extra docker layer 
+id=$(docker run -i -a stdin $IMAGE /bin/bash -c "cat << EOF > /start
+#!/bin/bash
+#
+export PROCFILE=\"$PROCFILE\"
+EOF")
+test $(docker wait $id) -eq 0
+docker commit $id $IMAGE > /dev/null
+
+id=$(echo "$shoreman" | docker run -i -a stdin $IMAGE /bin/bash -c "cat >> /start")
 test $(docker wait $id) -eq 0
 docker commit $id $IMAGE > /dev/null
